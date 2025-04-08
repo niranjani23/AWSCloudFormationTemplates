@@ -183,3 +183,322 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
 import joblib
+
+class TestFailureProcessor:
+    def __init__(self):
+        self.vectorizer = TfidfVectorizer(
+            max_features=1000,
+            stop_words='english',
+            ngram_range=(1, 2)
+        )
+        
+        self.scaler = StandardScaler()
+        
+        self.clusterer = DBSCAN(
+            eps=0.3,
+            min_samples=2,
+            metric='cosine'
+        )
+    
+    def extract_features(self, failures):
+        # 1. Process error messages using TF-IDF
+        error_texts = []
+        for failure in failures:
+            error_message = failure.get('error_message', '')
+            stack_trace = failure.get('stack_trace', '')
+            combined_text = f"{error_message} {stack_trace}"
+            error_texts.append(combined_text)
+        
+        # Apply TF-IDF vectorization
+        text_features = self.vectorizer.fit_transform(error_texts).toarray()
+        
+        # 2. Extract service features
+        service_features = []
+        for failure in failures:
+            service_name = failure.get('service_name', 'unknown')
+            service_features.append([1 if service_name == 'api-gateway' else 0,
+                                    1 if service_name == 'auth-service' else 0,
+                                    1 if service_name == 'data-service' else 0])
+        
+        service_features = np.array(service_features)
+        
+        # 3. Extract temporal features (simplified)
+        time_features = []
+        for failure in failures:
+            time_features.append([0, 0, 0])  # Placeholder
+        
+        time_features = np.array(time_features)
+        
+        # 4. Combine all features
+        combined_features = np.hstack([
+            text_features,
+            service_features,
+            time_features
+        ])
+        
+        return combined_features
+    
+    def find_patterns(self, failures):
+        features = self.extract_features(failures)
+        clusters = self.clusterer.fit_predict(features)
+        
+        # Group failures by cluster
+        patterns = []
+        
+        cluster_map = {}
+        for i, cluster_id in enumerate(clusters):
+            if cluster_id == -1:  # Noise points
+                continue
+                
+            if cluster_id not in cluster_map:
+                cluster_map[cluster_id] = []
+                
+            cluster_map[cluster_id].append(failures[i])
+        
+        # Create patterns from clusters
+        for cluster_id, cluster_failures in cluster_map.items():
+            if len(cluster_failures) < 2:
+                continue
+                
+            services = set([failure.get('service_name', 'unknown') for failure in cluster_failures])
+            error_types = set()
+            for failure in cluster_failures:
+                error_message = failure.get('error_message', '')
+                error_type = error_message.split(':')[0] if ':' in error_message else error_message
+                error_types.add(error_type)
+            
+            timestamps = [failure.get('timestamp', '') for failure in cluster_failures]
+            
+            pattern = {
+                'pattern_id': f"cluster-{cluster_id}-{pd.Timestamp.now().strftime('%Y%m%d')}",
+                'affected_services': list(services),
+                'error_types': list(error_types),
+                'failure_count': len(cluster_failures),
+                'confidence': 80.0 + min(len(cluster_failures) * 2, 15.0),
+                'first_occurrence': min(timestamps) if timestamps else '',
+                'last_occurrence': max(timestamps) if timestamps else ''
+            }
+            
+            patterns.append(pattern)
+        
+        return patterns
+
+def model_fn(model_dir):
+    """Load the model from disk"""
+    processor = TestFailureProcessor()
+    processor.vectorizer = joblib.load(os.path.join(model_dir, 'vectorizer.joblib'))
+    processor.clusterer = joblib.load(os.path.join(model_dir, 'clusterer.joblib'))
+    return processor
+
+def input_fn(request_body, request_content_type):
+    """Parse input data"""
+    if request_content_type == 'application/json':
+        data = json.loads(request_body)
+        return data.get('failures', [])
+    else:
+        raise ValueError(f"Unsupported content type: {request_content_type}")
+
+def predict_fn(input_data, model):
+    """Generate predictions"""
+    patterns = model.find_patterns(input_data)
+    return {'patterns': patterns}
+
+def output_fn(prediction, response_content_type):
+    """Format the prediction output"""
+    if response_content_type == 'application/json':
+        return json.dumps(prediction)
+    else:
+        raise ValueError(f"Unsupported content type: {response_content_type}")
+"""
+
+# Training script
+TRAIN_SCRIPT = """
+import argparse
+import json
+import os
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import DBSCAN
+import joblib
+
+# Import TestFailureProcessor
+from inference import TestFailureProcessor
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    
+    # Sagemaker specific arguments
+    parser.add_argument('--model-dir', type=str, default=os.environ.get('SM_MODEL_DIR'))
+    parser.add_argument('--train', type=str, default=os.environ.get('SM_CHANNEL_TRAIN'))
+    
+    args = parser.parse_args()
+    
+    # Load training data
+    print("Loading training data")
+    training_files = [os.path.join(args.train, file) for file in os.listdir(args.train) if file.endswith('.json')]
+    
+    failures = []
+    for file in training_files:
+        with open(file, 'r') as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                failures.extend(data)
+            else:
+                failures.append(data)
+    
+    print(f"Loaded {len(failures)} training examples")
+    
+    # Initialize and train processor
+    processor = TestFailureProcessor()
+    
+    # Extract features and fit the model
+    print("Training model")
+    features = processor.extract_features(failures)
+    processor.clusterer.fit(features)
+    
+    # Save the model
+    print(f"Saving model to {args.model_dir}")
+    joblib.dump(processor.vectorizer, os.path.join(args.model_dir, 'vectorizer.joblib'))
+    joblib.dump(processor.clusterer, os.path.join(args.model_dir, 'clusterer.joblib'))
+    
+    print("Training completed successfully")
+"""
+
+# Sample data for model training
+SAMPLE_DATA = """
+[
+  {
+    "failure_id": "test-failure-1",
+    "timestamp": "2023-06-15T14:23:15Z",
+    "service_name": "api-gateway",
+    "test_name": "api_response_test",
+    "error_message": "Error 502: Bad Gateway",
+    "stack_trace": "at line 45 in ApiController.java:processRequest() - Connection timed out",
+    "metadata": {
+      "environment": "staging",
+      "region": "us-west-2",
+      "commit_id": "a7c3e9d"
+    }
+  },
+  {
+    "failure_id": "test-failure-2",
+    "timestamp": "2023-06-15T14:25:20Z",
+    "service_name": "auth-service",
+    "test_name": "token_validation_test",
+    "error_message": "Token validation failed: timeout",
+    "stack_trace": "at line 78 in AuthValidator.java:validateToken() - Request timed out waiting for response",
+    "metadata": {
+      "environment": "staging",
+      "region": "us-west-2",
+      "commit_id": "b1d4f2e"
+    }
+  },
+  {
+    "failure_id": "test-failure-3",
+    "timestamp": "2023-06-15T14:27:45Z",
+    "service_name": "data-service",
+    "test_name": "query_performance_test",
+    "error_message": "Database query timeout",
+    "stack_trace": "at line 132 in DataRepository.java:executeQuery() - Connection pool exhausted",
+    "metadata": {
+      "environment": "staging",
+      "region": "us-west-2",
+      "commit_id": "c8e5a1b"
+    }
+  }
+]
+"""
+
+# Deployment script
+def deploy_sagemaker_model(role_arn, bucket_name, endpoint_name):
+    """
+    Deploy a SageMaker model for test failure analysis
+    
+    Args:
+        role_arn (str): ARN of the SageMaker execution role
+        bucket_name (str): S3 bucket name for model artifacts
+        endpoint_name (str): Name for the SageMaker endpoint
+    """
+    # Create a temporary directory for model files
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Create model code files
+        print(f"Creating model files in {tmp_dir}")
+        with open(os.path.join(tmp_dir, 'inference.py'), 'w') as f:
+            f.write(INFERENCE_SCRIPT)
+            
+        with open(os.path.join(tmp_dir, 'train.py'), 'w') as f:
+            f.write(TRAIN_SCRIPT)
+            
+        # Create sample data directory
+        data_dir = os.path.join(tmp_dir, 'data')
+        os.makedirs(data_dir, exist_ok=True)
+        
+        with open(os.path.join(data_dir, 'sample_failures.json'), 'w') as f:
+            f.write(SAMPLE_DATA)
+            
+        # Create a requirements.txt file
+        with open(os.path.join(tmp_dir, 'requirements.txt'), 'w') as f:
+            f.write("scikit-learn==1.0.2\npandas==1.4.2\njoblib==1.1.0\nnumpy==1.22.3")
+        
+        # Upload sample data to S3
+        print(f"Uploading sample data to S3 bucket {bucket_name}")
+        s3 = boto3.client('s3')
+        s3.upload_file(
+            os.path.join(data_dir, 'sample_failures.json'),
+            bucket_name,
+            'ai-quality/data/sample_failures.json'
+        )
+        
+        # Initialize SageMaker session
+        sagemaker_session = sagemaker.Session()
+        
+        # Create SKLearn estimator
+        sklearn_estimator = SKLearn(
+            entry_point='train.py',
+            source_dir=tmp_dir,
+            role=role_arn,
+            instance_count=1,
+            instance_type='ml.m5.large',
+            framework_version='0.23-1',
+            py_version='py3',
+            sagemaker_session=sagemaker_session
+        )
+        
+        # Train the model
+        print("Training the model")
+        train_data = f"s3://{bucket_name}/ai-quality/data"
+        sklearn_estimator.fit({'train': train_data})
+        
+        # Deploy the model
+        print(f"Deploying the model to endpoint {endpoint_name}")
+        predictor = sklearn_estimator.deploy(
+            initial_instance_count=1,
+            instance_type='ml.t2.medium',
+            endpoint_name=endpoint_name
+        )
+        
+        print(f"Model deployed successfully to endpoint {endpoint_name}")
+        
+        # Test the endpoint with a sample request
+        print("Testing the endpoint with a sample request")
+        response = predictor.predict(
+            {
+                'failures': json.loads(SAMPLE_DATA)
+            },
+            initial_args={'ContentType': 'application/json'}
+        )
+        
+        print(f"Endpoint test response: {response}")
+        
+        return predictor
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Deploy a SageMaker model for test failure analysis')
+    parser.add_argument('--role-arn', type=str, required=True, help='ARN of the SageMaker execution role')
+    parser.add_argument('--bucket-name', type=str, required=True, help='S3 bucket name for model artifacts')
+    parser.add_argument('--endpoint-name', type=str, default='test-failure-analyzer', help='Name for the SageMaker endpoint')
+    
+    args = parser.parse_args()
+    
+    deploy_sagemaker_model(args.role_arn, args.bucket_name, args.endpoint_name)
