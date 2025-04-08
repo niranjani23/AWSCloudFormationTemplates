@@ -1,0 +1,494 @@
+AWSTemplateFormatVersion: '2025-04-02'
+Description: 'AI Quality Engineering - API Gateway and Dashboard'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment environment
+  
+  BaseStackName:
+    Type: String
+    Description: Name of the base infrastructure stack
+    Default: ai-quality-base
+    
+  LambdaStackName:
+    Type: String
+    Description: Name of the lambda functions stack
+    Default: ai-quality-lambda
+
+Resources:
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ai-quality-api-${Environment}
+      Description: API for AI Quality Engineering Dashboard
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resources
+  PatternsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: patterns
+
+  ActionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: actions
+
+  StatsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: stats
+
+  # API Lambda Function
+  DashboardApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ai-quality-dashboard-api-${Environment}
+      Handler: app.lambda_handler
+      Role: 
+        Fn::ImportValue: !Sub ${BaseStackName}-LambdaExecutionRoleArn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          FAILURES_TABLE_NAME: 
+            Fn::ImportValue: !Sub ${BaseStackName}-FailuresTableName
+          ACTIONS_TABLE_NAME: 
+            Fn::ImportValue: !Sub ${BaseStackName}-ActionsTableName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              """Lambda handler for dashboard API"""
+              try:
+                  # Parse request
+                  http_method = event.get('httpMethod')
+                  path = event.get('path')
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  
+                  # Handle different API endpoints
+                  if path.endswith('/patterns'):
+                      return get_patterns(query_params)
+                  elif path.endswith('/actions'):
+                      return get_actions(query_params)
+                  elif path.endswith('/stats'):
+                      return get_stats(query_params)
+                  elif '/pattern/' in path:
+                      pattern_id = path.split('/')[-1]
+                      return get_pattern_details(pattern_id)
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': cors_headers(),
+                          'body': json.dumps({'error': 'Not Found'})
+                      }
+                      
+              except Exception as e:
+                  error_message = str(e)
+                  print(f"Error in API handler: {error_message}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'headers': cors_headers(),
+                      'body': json.dumps({
+                          'error': error_message
+                      })
+                  }
+
+          def cors_headers():
+              """Return CORS headers for all responses"""
+              return {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Methods': 'OPTIONS,GET'
+              }
+
+          def get_patterns(params):
+              """Get recent patterns"""
+              # Initialize DynamoDB client
+              failures_table_name = os.environ.get('FAILURES_TABLE_NAME')
+              actions_table_name = os.environ.get('ACTIONS_TABLE_NAME')
+              actions_table = dynamodb.Table(actions_table_name)
+              
+              # Get time range
+              days = int(params.get('days', '7'))
+              timestamp_threshold = (datetime.now() - timedelta(days=days)).isoformat()
+              
+              # Query for pattern detection actions
+              response = actions_table.scan(
+                  FilterExpression="timestamp > :threshold AND agent_type = :agent_type AND action_type = :action_type",
+                  ExpressionAttributeValues={
+                      ':threshold': timestamp_threshold,
+                      ':agent_type': 'pattern_detection',
+                      ':action_type': 'alert'
+                  }
+              )
+              
+              patterns = response.get('Items', [])
+              
+              # Sort by timestamp descending
+              patterns.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+              
+              # Limit to the requested number of patterns
+              limit = int(params.get('limit', '20'))
+              patterns = patterns[:limit]
+              
+              return {
+                  'statusCode': 200,
+                  'headers': cors_headers(),
+                  'body': json.dumps({
+                      'patterns': patterns
+                  })
+              }
+
+          def get_actions(params):
+              """Get recent actions"""
+              # Initialize DynamoDB client
+              actions_table_name = os.environ.get('ACTIONS_TABLE_NAME')
+              actions_table = dynamodb.Table(actions_table_name)
+              
+              # Get time range
+              days = int(params.get('days', '7'))
+              timestamp_threshold = (datetime.now() - timedelta(days=days)).isoformat()
+              
+              # Query for actions
+              response = actions_table.scan(
+                  FilterExpression="timestamp > :threshold",
+                  ExpressionAttributeValues={
+                      ':threshold': timestamp_threshold
+                  }
+              )
+              
+              actions = response.get('Items', [])
+              
+              # Filter by agent type if specified
+              agent_type = params.get('agent_type')
+              if agent_type:
+                  actions = [action for action in actions if action.get('agent_type') == agent_type]
+              
+              # Sort by timestamp descending
+              actions.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+              
+              # Limit to the requested number of actions
+              limit = int(params.get('limit', '50'))
+              actions = actions[:limit]
+              
+              return {
+                  'statusCode': 200,
+                  'headers': cors_headers(),
+                  'body': json.dumps({
+                      'actions': actions
+                  })
+              }
+
+          def get_stats(params):
+              """Get system statistics"""
+              # Initialize DynamoDB client
+              failures_table_name = os.environ.get('FAILURES_TABLE_NAME')
+              actions_table_name = os.environ.get('ACTIONS_TABLE_NAME')
+              actions_table = dynamodb.Table(actions_table_name)
+              failures_table = dynamodb.Table(failures_table_name)
+              
+              # Get time range
+              days = int(params.get('days', '7'))
+              timestamp_threshold = (datetime.now() - timedelta(days=days)).isoformat()
+              
+              # Get pattern count
+              pattern_response = actions_table.scan(
+                  FilterExpression="timestamp > :threshold AND agent_type = :agent_type AND action_type = :action_type",
+                  ExpressionAttributeValues={
+                      ':threshold': timestamp_threshold,
+                      ':agent_type': 'pattern_detection',
+                      ':action_type': 'alert'
+                  },
+                  Select='COUNT'
+              )
+              
+              pattern_count = pattern_response.get('Count', 0)
+              
+              # Get failure count
+              failure_response = failures_table.scan(
+                  FilterExpression="timestamp > :threshold",
+                  ExpressionAttributeValues={
+                      ':threshold': timestamp_threshold
+                  },
+                  Select='COUNT'
+              )
+              
+              failure_count = failure_response.get('Count', 0)
+              
+              # Return statistics
+              return {
+                  'statusCode': 200,
+                  'headers': cors_headers(),
+                  'body': json.dumps({
+                      'stats': {
+                          'patterns_detected': pattern_count,
+                          'failures_analyzed': failure_count,
+                          'time_range_days': days
+                      }
+                  })
+              }
+
+          def get_pattern_details(pattern_id):
+              """Get details for a specific pattern"""
+              # Initialize DynamoDB client
+              actions_table_name = os.environ.get('ACTIONS_TABLE_NAME')
+              actions_table = dynamodb.Table(actions_table_name)
+              
+              # Query for the pattern
+              response = actions_table.scan(
+                  FilterExpression="pattern_id = :pattern_id",
+                  ExpressionAttributeValues={
+                      ':pattern_id': pattern_id
+                  }
+              )
+              
+              actions = response.get('Items', [])
+              
+              if not actions:
+                  return {
+                      'statusCode': 404,
+                      'headers': cors_headers(),
+                      'body': json.dumps({
+                          'error': f"Pattern {pattern_id} not found"
+                      })
+                  }
+              
+              # Organize actions by agent type
+              pattern_data = {
+                  'pattern_id': pattern_id,
+                  'detection': None,
+                  'diagnostic': None,
+                  'remediation': None,
+                  'tests': []
+              }
+              
+              for action in actions:
+                  agent_type = action.get('agent_type')
+                  
+                  if agent_type == 'pattern_detection':
+                      pattern_data['detection'] = action
+                  elif agent_type == 'diagnostic':
+                      pattern_data['diagnostic'] = action
+                  elif agent_type == 'remediation':
+                      pattern_data['remediation'] = action
+                  elif agent_type == 'test_generation':
+                      pattern_data['tests'].append(action)
+              
+              return {
+                  'statusCode': 200,
+                  'headers': cors_headers(),
+                  'body': json.dumps({
+                      'pattern': pattern_data
+                  })
+              }
+
+  # API Gateway Methods
+  PatternsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref PatternsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DashboardApiFunction.Arn}/invocations
+
+  ActionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ActionsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DashboardApiFunction.Arn}/invocations
+
+  StatsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref StatsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DashboardApiFunction.Arn}/invocations
+
+  # CORS Options Methods
+  PatternsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref PatternsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: "{\"statusCode\": 200}"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ActionsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ActionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: "{\"statusCode\": 200}"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  StatsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref StatsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: "{\"statusCode\": 200}"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions
+  DashboardApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PatternsMethod
+      - ActionsMethod
+      - StatsMethod
+      - PatternsOptionsMethod
+      - ActionsOptionsMethod
+      - StatsOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref Environment
+
+  # Dashboard S3 Bucket
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ai-quality-dashboard-${Environment}-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+
+  # Dashboard Bucket Policy
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub ${DashboardBucket.Arn}/*
+
+  # Dashboard Index Page
+  DashboardIndexFile:
+    Type: AWS::S3::Object
+    Properties:
+      Bucket: !Ref DashboardBucket
+      Key: index.html
+      ContentType: text/html
+      Body: !Sub |
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>AI Quality Engineering Dashboard</title>
+            <link href
