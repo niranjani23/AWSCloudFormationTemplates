@@ -491,4 +491,268 @@ Resources:
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>AI Quality Engineering Dashboard</title>
-            <link href
+            <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+        </head>
+        <body class="bg-gray-100">
+            <div class="container mx-auto px-4 py-8">
+                <header class="mb-8">
+                    <h1 class="text-3xl font-bold">AI Quality Engineering Dashboard</h1>
+                    <div class="mt-4 flex items-center">
+                        <label for="timeRange" class="mr-2">Time Range:</label>
+                        <select id="timeRange" class="border rounded px-2 py-1">
+                            <option value="1">1 Day</option>
+                            <option value="7" selected>7 Days</option>
+                            <option value="30">30 Days</option>
+                            <option value="90">90 Days</option>
+                        </select>
+                    </div>
+                </header>
+                
+                <!-- Statistics Cards -->
+                <div id="statsContainer" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
+                    <div class="bg-white rounded-lg shadow p-4">
+                        <h2 class="text-lg font-semibold mb-2">Patterns Detected</h2>
+                        <p class="text-3xl" id="patternsCount">Loading...</p>
+                    </div>
+                    <div class="bg-white rounded-lg shadow p-4">
+                        <h2 class="text-lg font-semibold mb-2">Failures Analyzed</h2>
+                        <p class="text-3xl" id="failuresCount">Loading...</p>
+                    </div>
+                    <div class="bg-white rounded-lg shadow p-4">
+                        <h2 class="text-lg font-semibold mb-2">Success Rate</h2>
+                        <p class="text-3xl" id="successRate">Loading...</p>
+                    </div>
+                </div>
+                
+                <!-- Recent Patterns -->
+                <div class="bg-white rounded-lg shadow p-4 mb-8">
+                    <h2 class="text-xl font-semibold mb-4">Recent Patterns</h2>
+                    <div id="patternsContainer" class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Pattern ID</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Affected Services</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Confidence</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Timestamp</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Details</th>
+                                </tr>
+                            </thead>
+                            <tbody id="patternsTableBody" class="bg-white divide-y divide-gray-200">
+                                <tr>
+                                    <td colspan="5" class="px-6 py-4 text-center">Loading patterns...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                
+                <!-- Pattern Details (hidden by default) -->
+                <div id="patternDetails" class="bg-white rounded-lg shadow p-4 mb-8 hidden">
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-xl font-semibold">Pattern Details: <span id="patternIdDisplay"></span></h2>
+                        <button id="closeDetails" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded">Close</button>
+                    </div>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4" id="patternDetailsContent">
+                        <!-- Content will be dynamically populated -->
+                    </div>
+                </div>
+            </div>
+            
+            <script>
+                // API URL
+                const API_URL = '${ApiDeployment.ApiEndpoint}';
+                
+                // DOM Elements
+                const timeRangeSelect = document.getElementById('timeRange');
+                const patternsTableBody = document.getElementById('patternsTableBody');
+                const patternsCount = document.getElementById('patternsCount');
+                const failuresCount = document.getElementById('failuresCount');
+                const successRate = document.getElementById('successRate');
+                const patternDetails = document.getElementById('patternDetails');
+                const patternIdDisplay = document.getElementById('patternIdDisplay');
+                const patternDetailsContent = document.getElementById('patternDetailsContent');
+                const closeDetailsButton = document.getElementById('closeDetails');
+                
+                // Event Listeners
+                timeRangeSelect.addEventListener('change', fetchDashboardData);
+                closeDetailsButton.addEventListener('click', () => {
+                    patternDetails.classList.add('hidden');
+                });
+                
+                // Initial data fetch
+                fetchDashboardData();
+                
+                // Functions
+                function fetchDashboardData() {
+                    const days = timeRangeSelect.value;
+                    
+                    // Fetch statistics
+                    fetch(`$${API_URL}/${Environment}/stats?days=$${days}`)
+                        .then(response => response.json())
+                        .then(data => {
+                            const stats = data.stats;
+                            patternsCount.textContent = stats.patterns_detected;
+                            failuresCount.textContent = stats.failures_analyzed;
+                            
+                            // Calculate success rate
+                            const rate = stats.failures_analyzed > 0 
+                                ? Math.round((stats.patterns_detected / stats.failures_analyzed) * 100) 
+                                : 0;
+                            successRate.textContent = `$${rate}%`;
+                        })
+                        .catch(error => {
+                            console.error('Error fetching stats:', error);
+                            patternsCount.textContent = 'Error';
+                            failuresCount.textContent = 'Error';
+                            successRate.textContent = 'Error';
+                        });
+                    
+                    // Fetch patterns
+                    fetch(`$${API_URL}/${Environment}/patterns?days=$${days}&limit=10`)
+                        .then(response => response.json())
+                        .then(data => {
+                            const patterns = data.patterns;
+                            
+                            if (patterns.length === 0) {
+                                patternsTableBody.innerHTML = `
+                                    <tr>
+                                        <td colspan="5" class="px-6 py-4 text-center">No patterns detected in the selected time range.</td>
+                                    </tr>
+                                `;
+                                return;
+                            }
+                            
+                            patternsTableBody.innerHTML = patterns.map(pattern => {
+                                const details = pattern.details || {};
+                                const affectedServices = details.affected_services || [];
+                                const confidence = details.confidence || 0;
+                                const timestamp = new Date(pattern.timestamp).toLocaleString();
+                                
+                                return `
+                                    <tr>
+                                        <td class="px-6 py-4 whitespace-nowrap">${pattern.pattern_id}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap">${affectedServices.join(', ') || 'N/A'}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap">${confidence}%</td>
+                                        <td class="px-6 py-4 whitespace-nowrap">${timestamp}</td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <button 
+                                                onclick="viewPatternDetails('${pattern.pattern_id}')" 
+                                                class="text-blue-500 hover:text-blue-700"
+                                            >
+                                                View Details
+                                            </button>
+                                        </td>
+                                    </tr>
+                                `;
+                            }).join('');
+                        })
+                        .catch(error => {
+                            console.error('Error fetching patterns:', error);
+                            patternsTableBody.innerHTML = `
+                                <tr>
+                                    <td colspan="5" class="px-6 py-4 text-center">Error loading patterns.</td>
+                                </tr>
+                            `;
+                        });
+                }
+                
+                function viewPatternDetails(patternId) {
+                    patternIdDisplay.textContent = patternId;
+                    patternDetailsContent.innerHTML = '<div class="col-span-2 text-center">Loading details...</div>';
+                    patternDetails.classList.remove('hidden');
+                    
+                    fetch(`$${API_URL}/${Environment}/pattern/$${patternId}`)
+                        .then(response => response.json())
+                        .then(data => {
+                            const pattern = data.pattern;
+                            
+                            if (!pattern) {
+                                patternDetailsContent.innerHTML = '<div class="col-span-2 text-center">Pattern details not found.</div>';
+                                return;
+                            }
+                            
+                            let detailsHtml = '';
+                            
+                            // Detection Details
+                            if (pattern.detection) {
+                                const details = pattern.detection.details || {};
+                                detailsHtml += `
+                                    <div class="border rounded p-4">
+                                        <h3 class="text-lg font-medium mb-2">Detection</h3>
+                                        <div class="mb-2">
+                                            <strong>Affected Services:</strong> ${(details.affected_services || []).join(', ') || 'N/A'}
+                                        </div>
+                                        <div class="mb-2">
+                                            <strong>Confidence:</strong> ${details.confidence || 'N/A'}%
+                                        </div>
+                                        <div class="mb-2">
+                                            <strong>Error Types:</strong> ${(details.error_types || []).join(', ') || 'N/A'}
+                                        </div>
+                                        <div class="mb-2">
+                                            <strong>Detected At:</strong> ${new Date(pattern.detection.timestamp).toLocaleString()}
+                                        </div>
+                                    </div>
+                                `;
+                            }
+                            
+                            patternDetailsContent.innerHTML = detailsHtml || '<div class="col-span-2 text-center">No detailed information available.</div>';
+                        })
+                        .catch(error => {
+                            console.error('Error fetching pattern details:', error);
+                            patternDetailsContent.innerHTML = '<div class="col-span-2 text-center">Error loading pattern details.</div>';
+                        });
+                }
+                
+                // Make viewPatternDetails globally available
+                window.viewPatternDetails = viewPatternDetails;
+            </script>
+        </body>
+        </html>
+
+  # Error Page
+  DashboardErrorFile:
+    Type: AWS::S3::Object
+    Properties:
+      Bucket: !Ref DashboardBucket
+      Key: error.html
+      ContentType: text/html
+      Body: |
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Error - AI Quality Engineering Dashboard</title>
+            <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+        </head>
+        <body class="bg-gray-100">
+            <div class="container mx-auto px-4 py-8">
+                <div class="max-w-md mx-auto bg-white rounded-lg shadow p-8 mt-16">
+                    <h1 class="text-2xl font-bold mb-4 text-red-600">Error</h1>
+                    <p class="mb-4">Something went wrong while loading the dashboard.</p>
+                    <a href="/" class="inline-block bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded">Go back to dashboard</a>
+                </div>
+            </div>
+        </body>
+        </html>
+
+Outputs:
+  ApiGatewayUrl:
+    Description: URL of the API Gateway
+    Value: !Sub ${ApiDeployment.UrlForStage}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiGatewayUrl
+
+  ApiEndpoint:
+    Description: API Endpoint
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  DashboardUrl:
+    Description: URL of the Dashboard
+    Value: !Sub http://${DashboardBucket.WebsiteURL}
+    Export:
+      Name: !Sub ${AWS::StackName}-DashboardUrl
