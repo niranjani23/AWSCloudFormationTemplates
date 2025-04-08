@@ -1,0 +1,430 @@
+AWSTemplateFormatVersion: '2025-04-02'
+Description: 'AI Quality Engineering - Lambda Functions'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment environment
+  
+  BaseStackName:
+    Type: String
+    Description: Name of the base infrastructure stack
+    Default: ai-quality-base
+
+  ModelEndpoint:
+    Type: String
+    Description: SageMaker endpoint for pattern detection
+    Default: test-failure-analyzer
+
+Resources:
+  # Lambda Functions
+  DataIngestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ai-quality-ingest-${Environment}
+      Handler: app.lambda_handler
+      Role: 
+        Fn::ImportValue: !Sub ${BaseStackName}-LambdaExecutionRoleArn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          FAILURES_TABLE_NAME: 
+            Fn::ImportValue: !Sub ${BaseStackName}-FailuresTableName
+          DATA_BUCKET_NAME: 
+            Fn::ImportValue: !Sub ${BaseStackName}-DataBucketName
+          EVENT_BUS_NAME: 
+            Fn::ImportValue: !Sub ${BaseStackName}-EventBusName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime, timedelta
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          events = boto3.client('events')
+
+          def lambda_handler(event, context):
+              """Lambda function to process incoming test failures"""
+              try:
+                  # Get environment variables
+                  failures_table_name = os.environ.get('FAILURES_TABLE_NAME')
+                  data_bucket_name = os.environ.get('DATA_BUCKET_NAME')
+                  event_bus_name = os.environ.get('EVENT_BUS_NAME')
+                  
+                  # Get the failures table
+                  failures_table = dynamodb.Table(failures_table_name)
+                  
+                  # Process test results from various sources
+                  if 'source' in event:
+                      source_type = event['source']
+                      
+                      if source_type == 'jenkins':
+                          # Process Jenkins test results
+                          failures = process_jenkins_results(event)
+                      elif source_type == 'github-actions':
+                          # Process GitHub Actions test results
+                          failures = process_github_actions_results(event)
+                      elif source_type == 'custom-test-runner':
+                          # Process custom test runner results
+                          failures = process_custom_test_results(event)
+                      else:
+                          # Process generic test results
+                          failures = event.get('failures', [])
+                              
+                      # Store each failure in DynamoDB
+                      for failure in failures:
+                          failure_id = f"test-failure-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+                          timestamp = datetime.now().isoformat()
+                          ttl = int((datetime.now() + timedelta(days=90)).timestamp())
+                          
+                          item = {
+                              'failure_id': failure_id,
+                              'timestamp': timestamp,
+                              'ttl': ttl,
+                              **failure
+                          }
+                          
+                          failures_table.put_item(Item=item)
+                          
+                          # Store raw data in S3 for historical analysis
+                          s3_key = f"raw-failures/{failure_id}.json"
+                          s3.put_object(
+                              Bucket=data_bucket_name,
+                              Key=s3_key,
+                              Body=json.dumps(failure),
+                              ContentType='application/json'
+                          )
+                      
+                      # Send event to EventBridge for processing
+                      events.put_events(
+                          Entries=[
+                              {
+                                  'Source': 'ai-quality-engineering',
+                                  'DetailType': 'TestFailuresIngested',
+                                  'Detail': json.dumps({
+                                      'count': len(failures),
+                                      'source': source_type,
+                                      'timestamp': datetime.now().isoformat()
+                                  }),
+                                  'EventBusName': event_bus_name
+                              }
+                          ]
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f"Successfully processed {len(failures)} failures",
+                              'failures_count': len(failures)
+                          })
+                      }
+                  else:
+                      raise ValueError("Event source not specified")
+                      
+              except Exception as e:
+                  print(f"Error processing test results: {str(e)}")
+                  raise
+
+          def process_jenkins_results(event):
+              """Process test results from Jenkins"""
+              failures = []
+              
+              build_results = event.get('build_results', {})
+              for test_result in build_results.get('failed_tests', []):
+                  failure = {
+                      'service_name': test_result.get('module', 'unknown'),
+                      'test_name': test_result.get('name', 'unknown'),
+                      'error_message': test_result.get('error_message', ''),
+                      'stack_trace': test_result.get('stack_trace', ''),
+                      'metadata': {
+                          'environment': event.get('environment', 'unknown'),
+                          'build_number': build_results.get('build_number', 'unknown'),
+                          'job_name': build_results.get('job_name', 'unknown')
+                      }
+                  }
+                  failures.append(failure)
+              
+              return failures
+
+          def process_github_actions_results(event):
+              """Process test results from GitHub Actions"""
+              failures = []
+              
+              workflow_run = event.get('workflow_run', {})
+              for test_result in workflow_run.get('failed_tests', []):
+                  failure = {
+                      'service_name': test_result.get('name', '').split('.')[0],
+                      'test_name': test_result.get('name', 'unknown'),
+                      'error_message': test_result.get('message', ''),
+                      'stack_trace': test_result.get('details', ''),
+                      'metadata': {
+                          'environment': event.get('environment', 'unknown'),
+                          'run_id': workflow_run.get('id', 'unknown'),
+                          'repository': event.get('repository', 'unknown')
+                      }
+                  }
+                  failures.append(failure)
+              
+              return failures
+
+          def process_custom_test_results(event):
+              """Process test results from custom test runner"""
+              failures = event.get('failures', [])
+              return failures
+
+  PatternDetectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ai-quality-pattern-detection-${Environment}
+      Handler: app.lambda_handler
+      Role: 
+        Fn::ImportValue: !Sub ${BaseStackName}-LambdaExecutionRoleArn
+      Runtime: python3.9
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          FAILURES_TABLE_NAME: 
+            Fn::ImportValue: !Sub ${BaseStackName}-FailuresTableName
+          ACTIONS_TABLE_NAME: 
+            Fn::ImportValue: !Sub ${BaseStackName}-ActionsTableName
+          DATA_BUCKET_NAME: 
+            Fn::ImportValue: !Sub ${BaseStackName}-DataBucketName
+          ALERT_TOPIC_ARN: 
+            Fn::ImportValue: !Sub ${BaseStackName}-AlertTopicArn
+          MODEL_ENDPOINT: !Ref ModelEndpoint
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime, timedelta
+
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          sagemaker_runtime = boto3.client('sagemaker-runtime')
+          sns = boto3.client('sns')
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              """Lambda handler for pattern detection"""
+              try:
+                  # Get environment variables
+                  failures_table_name = os.environ.get('FAILURES_TABLE_NAME')
+                  actions_table_name = os.environ.get('ACTIONS_TABLE_NAME')
+                  data_bucket_name = os.environ.get('DATA_BUCKET_NAME')
+                  alert_topic_arn = os.environ.get('ALERT_TOPIC_ARN')
+                  model_endpoint = os.environ.get('MODEL_ENDPOINT')
+                  
+                  # Get tables
+                  failures_table = dynamodb.Table(failures_table_name)
+                  actions_table = dynamodb.Table(actions_table_name)
+                  
+                  # Get recent failures (last 24 hours)
+                  hours_back = 24
+                  timestamp_threshold = (datetime.now() - timedelta(hours=hours_back)).isoformat()
+                  
+                  response = failures_table.scan(
+                      FilterExpression="timestamp > :threshold",
+                      ExpressionAttributeValues={':threshold': timestamp_threshold}
+                  )
+                  
+                  failures = response.get('Items', [])
+                  print(f"Found {len(failures)} recent failures to analyze")
+                  
+                  if not failures:
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': "No recent failures to analyze",
+                              'timestamp': datetime.now().isoformat()
+                          })
+                      }
+                  
+                  # Prepare payload for SageMaker endpoint
+                  # If you haven't created a SageMaker endpoint yet, you can use
+                  # basic pattern detection logic instead
+                  try:
+                      # Call SageMaker endpoint if available
+                      payload = {
+                          'failures': failures,
+                          'timestamp': datetime.now().isoformat()
+                      }
+                      
+                      response = sagemaker_runtime.invoke_endpoint(
+                          EndpointName=model_endpoint,
+                          ContentType='application/json',
+                          Body=json.dumps(payload)
+                      )
+                      
+                      result = json.loads(response['Body'].read().decode())
+                      patterns = result.get('patterns', [])
+                      
+                  except Exception as e:
+                      print(f"Error calling SageMaker endpoint: {str(e)}")
+                      print("Using basic pattern detection instead")
+                      
+                      # Fallback to basic pattern detection if SageMaker endpoint is not available
+                      patterns = basic_pattern_detection(failures)
+                  
+                  # Process detected patterns
+                  for pattern in patterns:
+                      pattern_id = pattern.get('pattern_id', f"pattern-{uuid.uuid4().hex[:8]}")
+                      affected_services = pattern.get('affected_services', [])
+                      
+                      # Create action record
+                      action_id = f"action-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+                      timestamp = datetime.now().isoformat()
+                      
+                      action = {
+                          'action_id': action_id,
+                          'pattern_id': pattern_id,
+                          'timestamp': timestamp,
+                          'agent_type': 'pattern_detection',
+                          'action_type': 'alert',
+                          'status': 'completed',
+                          'details': pattern
+                      }
+                      
+                      # Store action in DynamoDB
+                      actions_table.put_item(Item=action)
+                      
+                      # Send SNS notification
+                      subject = f"Pattern Detected: {pattern_id}"
+                      if affected_services:
+                          subject += f" affecting {', '.join(affected_services[:3])}"
+                          if len(affected_services) > 3:
+                              subject += f" and {len(affected_services) - 3} more"
+                      
+                      message = json.dumps(pattern, indent=2)
+                      sns.publish(
+                          TopicArn=alert_topic_arn,
+                          Subject=subject,
+                          Message=message
+                      )
+                      
+                      print(f"Processed pattern {pattern_id} affecting {len(affected_services)} services")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f"Processed {len(patterns)} patterns",
+                          'pattern_count': len(patterns),
+                          'timestamp': datetime.now().isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in pattern detection: {str(e)}")
+                  raise
+                  
+          def basic_pattern_detection(failures):
+              """Basic pattern detection logic as a fallback"""
+              # Group failures by service
+              service_groups = {}
+              for failure in failures:
+                  service_name = failure.get('service_name', 'unknown')
+                  if service_name not in service_groups:
+                      service_groups[service_name] = []
+                  service_groups[service_name].append(failure)
+              
+              # Find services with multiple failures
+              patterns = []
+              for service_name, service_failures in service_groups.items():
+                  if len(service_failures) >= 2:
+                      # Group by error type
+                      error_groups = {}
+                      for failure in service_failures:
+                          error_message = failure.get('error_message', '')
+                          error_type = error_message.split(':')[0] if ':' in error_message else error_message
+                          if error_type not in error_groups:
+                              error_groups[error_type] = []
+                          error_groups[error_type].append(failure)
+                      
+                      # Create patterns for error types with multiple failures
+                      for error_type, error_failures in error_groups.items():
+                          if len(error_failures) >= 2:
+                              pattern = {
+                                  'pattern_id': f"pattern-{service_name}-{error_type}-{datetime.now().strftime('%Y%m%d')}",
+                                  'affected_services': [service_name],
+                                  'error_types': [error_type],
+                                  'failure_count': len(error_failures),
+                                  'confidence': 70.0,
+                                  'first_occurrence': min([failure.get('timestamp', '') for failure in error_failures]),
+                                  'last_occurrence': max([failure.get('timestamp', '') for failure in error_failures])
+                              }
+                              patterns.append(pattern)
+              
+              return patterns
+
+  # EventBridge Rule
+  PatternDetectionScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ai-quality-pattern-detection-schedule-${Environment}
+      Description: Schedule for pattern detection
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PatternDetectionFunction.Arn
+          Id: PatternDetectionTarget
+
+  PatternDetectionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PatternDetectionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PatternDetectionScheduleRule.Arn
+
+  TestFailuresIngestedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ai-quality-failures-ingested-rule-${Environment}
+      Description: Trigger pattern detection when new failures are ingested
+      EventBusName: 
+        Fn::ImportValue: !Sub ${BaseStackName}-EventBusName
+      EventPattern:
+        source:
+          - ai-quality-engineering
+        detail-type:
+          - TestFailuresIngested
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PatternDetectionFunction.Arn
+          Id: PatternDetectionTarget
+
+  TestFailuresIngestedPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PatternDetectionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TestFailuresIngestedRule.Arn
+
+Outputs:
+  DataIngestFunctionArn:
+    Description: Lambda function for data ingestion
+    Value: !GetAtt DataIngestFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-DataIngestFunctionArn
+
+  PatternDetectionFunctionArn:
+    Description: Lambda function for pattern detection
+    Value: !GetAtt PatternDetectionFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-PatternDetectionFunctionArn
