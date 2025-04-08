@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2025-04-02'
+Description: 'AI Quality Engineering - Base Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment environment
+
+Resources:
+  # Storage Resources
+  FailuresTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ai-quality-failures-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: failure_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: failure_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  ActionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ai-quality-actions-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: action_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: action_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ai-quality-data-${Environment}-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveRule
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            ExpirationInDays: 365
+
+  # Notification Resources
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ai-quality-alerts-${Environment}
+      DisplayName: AI Quality Engineering Alerts
+
+  # EventBridge Resources
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub ai-quality-events-${Environment}
+
+  # IAM Resources
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ai-quality-lambda-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AIQualityLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt FailuresTable.Arn
+                  - !GetAtt ActionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub ${DataBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt EventBus.Arn
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ai-quality-sagemaker-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: AIQualitySageMakerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub ${DataBucket.Arn}/*
+
+Outputs:
+  FailuresTableName:
+    Description: DynamoDB table for test failures
+    Value: !Ref FailuresTable
+    Export:
+      Name: !Sub ${AWS::StackName}-FailuresTableName
+
+  ActionsTableName:
+    Description: DynamoDB table for agent actions
+    Value: !Ref ActionsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-ActionsTableName
+
+  DataBucketName:
+    Description: S3 bucket for test failure data
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-DataBucketName
+
+  AlertTopicArn:
+    Description: SNS topic for alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-AlertTopicArn
+
+  EventBusName:
+    Description: EventBridge bus for quality events
+    Value: !Ref EventBus
+    Export:
+      Name: !Sub ${AWS::StackName}-EventBusName
+
+  LambdaExecutionRoleArn:
+    Description: IAM role for Lambda functions
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaExecutionRoleArn
+
+  SageMakerExecutionRoleArn:
+    Description: IAM role for SageMaker
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-SageMakerExecutionRoleArn
