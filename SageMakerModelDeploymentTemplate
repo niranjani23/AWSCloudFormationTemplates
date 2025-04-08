@@ -1,0 +1,185 @@
+"""
+SageMaker Model Deployment Script for AI Quality Engineering
+
+This script deploys a custom ML model for test failure analysis to SageMaker.
+Before running, you need to:
+1. Create a Python environment with boto3, sagemaker, and sklearn installed
+2. Configure AWS credentials
+3. Prepare your model code and dependencies
+
+Usage:
+python deploy_model.py --role-arn <sagemaker-execution-role> --bucket-name <s3-bucket> --endpoint-name <endpoint-name>
+"""
+
+import argparse
+import boto3
+import sagemaker
+from sagemaker.sklearn import SKLearn
+import os
+import tarfile
+import tempfile
+import shutil
+
+# Sample implementation of TestFailureProcessor class (model code)
+TEST_FAILURE_PROCESSOR_CODE = """
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
+import joblib
+import json
+
+class TestFailureProcessor:
+    def __init__(self):
+        self.vectorizer = TfidfVectorizer(
+            max_features=1000,            # Limit vocabulary size
+            stop_words='english',         # Remove common English words
+            ngram_range=(1, 2)            # Use both single terms and bigrams
+        )
+        
+        self.scaler = StandardScaler()    # For normalizing numerical features
+        
+        self.clusterer = DBSCAN(
+            eps=0.3,                      # Maximum distance between samples
+            min_samples=2,                # Minimum samples for core points
+            metric='cosine'               # Similarity measure for text
+        )
+    
+    def fit(self, failures):
+        """Fit the model to the data"""
+        features = self.extract_features(failures)
+        self.clusterer.fit(features)
+        return self
+    
+    def extract_features(self, failures):
+        """Extract features from test failures"""
+        # 1. Process error messages using TF-IDF
+        error_texts = []
+        for failure in failures:
+            error_message = failure.get('error_message', '')
+            stack_trace = failure.get('stack_trace', '')
+            
+            # Combine error messages and stack traces
+            combined_text = f"{error_message} {stack_trace}"
+            error_texts.append(combined_text)
+        
+        # Apply TF-IDF vectorization
+        text_features = self.vectorizer.fit_transform(error_texts).toarray()
+        
+        # 2. Extract service features
+        service_features = []
+        for failure in failures:
+            # One-hot encode service names
+            service_name = failure.get('service_name', 'unknown')
+            # In a real implementation, you would use a more sophisticated approach
+            # This is a simplified version for illustration
+            service_features.append([1 if service_name == 'api-gateway' else 0,
+                                    1 if service_name == 'auth-service' else 0,
+                                    1 if service_name == 'data-service' else 0])
+        
+        service_features = np.array(service_features)
+        
+        # 3. Extract temporal features
+        time_features = []
+        for failure in failures:
+            # For simplicity, we're not actually extracting temporal features here
+            # In a real implementation, you would parse timestamps and calculate deltas
+            time_features.append([0, 0, 0])  # Placeholder
+        
+        time_features = np.array(time_features)
+        
+        # 4. Combine all features
+        combined_features = np.hstack([
+            text_features,
+            service_features,
+            time_features
+        ])
+        
+        return combined_features
+    
+    def find_patterns(self, failures):
+        """Find patterns in test failures"""
+        features = self.extract_features(failures)
+        clusters = self.clusterer.fit_predict(features)
+        
+        # Group failures by cluster
+        patterns = []
+        
+        cluster_map = {}
+        for i, cluster_id in enumerate(clusters):
+            if cluster_id == -1:  # Noise points
+                continue
+                
+            if cluster_id not in cluster_map:
+                cluster_map[cluster_id] = []
+                
+            cluster_map[cluster_id].append(failures[i])
+        
+        # Create patterns from clusters
+        for cluster_id, cluster_failures in cluster_map.items():
+            if len(cluster_failures) < 2:
+                continue
+                
+            services = set([failure.get('service_name', 'unknown') for failure in cluster_failures])
+            error_types = set()
+            for failure in cluster_failures:
+                error_message = failure.get('error_message', '')
+                error_type = error_message.split(':')[0] if ':' in error_message else error_message
+                error_types.add(error_type)
+            
+            timestamps = [failure.get('timestamp', '') for failure in cluster_failures]
+            
+            pattern = {
+                'pattern_id': f"cluster-{cluster_id}-{pd.Timestamp.now().strftime('%Y%m%d')}",
+                'affected_services': list(services),
+                'error_types': list(error_types),
+                'failure_count': len(cluster_failures),
+                'confidence': 80.0 + min(len(cluster_failures) * 2, 15.0),  # Confidence based on cluster size
+                'first_occurrence': min(timestamps) if timestamps else '',
+                'last_occurrence': max(timestamps) if timestamps else ''
+            }
+            
+            patterns.append(pattern)
+        
+        return patterns
+
+# SageMaker entry point functions
+def model_fn(model_dir):
+    """Load the model from disk"""
+    processor = TestFailureProcessor()
+    processor.vectorizer = joblib.load(os.path.join(model_dir, 'vectorizer.joblib'))
+    processor.clusterer = joblib.load(os.path.join(model_dir, 'clusterer.joblib'))
+    return processor
+
+def input_fn(request_body, request_content_type):
+    """Parse input data"""
+    if request_content_type == 'application/json':
+        data = json.loads(request_body)
+        return data.get('failures', [])
+    else:
+        raise ValueError(f"Unsupported content type: {request_content_type}")
+
+def predict_fn(input_data, model):
+    """Generate predictions"""
+    patterns = model.find_patterns(input_data)
+    return {'patterns': patterns}
+
+def output_fn(prediction, response_content_type):
+    """Format the prediction output"""
+    if response_content_type == 'application/json':
+        return json.dumps(prediction)
+    else:
+        raise ValueError(f"Unsupported content type: {response_content_type}")
+"""
+
+# Sample inference script
+INFERENCE_SCRIPT = """
+import os
+import json
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
+import joblib
